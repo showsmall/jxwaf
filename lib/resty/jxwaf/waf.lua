@@ -11,6 +11,7 @@ local table_sort = table.sort
 local table_concat = table.concat
 local http = require "resty.jxwaf.http"
 local upload = require "resty.upload"
+local limitreq = require "resty.jxwaf.limitreq"
 local _M = {}
 _M.version = "1.0"
 
@@ -19,6 +20,8 @@ local _config_path = "/opt/jxwaf/nginx/conf/jxwaf/jxwaf_config.json"
 local _config_info = {}
 local _rules = {}
 local _resp_rules = {}
+local _limit_req_rules = {}
+local _resp_header_chunk = nil
 local function _sort_rules(a,b)
         return tonumber(a.rule_id)<tonumber(b.rule_id)
 end
@@ -229,10 +232,38 @@ end
 
 local function _rule_match(rules)
 	local result
-	ngx.ctx.rule_observ_log = {}
+	local rule_observ_log = {}
 	for _,rule in ipairs(rules) do
 		
-	
+		if _config_info.limitreq_engine == "true" and rule.rule_global == "true"   then    --limit_req start
+
+		local process_key
+		local limit_var = {}
+		for _,var in ipairs(rule.rule_key_vars) do
+			local process_request_var = _process_request(var)
+			if type(process_request_var) == "table" then
+				for _,v in pairs(process_request_var) do
+					if type(v) == "table" then
+						ngx.log(ngx.ERR,"LIMIT ERROR")
+						ngx.exit(403)
+					end
+					table.insert( limit_var, v )
+				end
+			else
+				table.insert( limit_var, process_request_var )
+			end
+		end
+
+		process_key = table.concat( limit_var )  
+		if rule.rule_action == "limit_req_rate" then
+			limitreq.limit_req_rate(rule,ngx.md5(process_key))
+		elseif rule.rule_action == "limit_req_count" then
+			limitreq.limit_req_count(rule,ngx.md5(process_key))		
+		end
+		
+
+		else
+
 			local matchs_result = true
 			local ctx_rule_log = {}
 			for _,match in ipairs(rule.rule_matchs) do
@@ -257,7 +288,7 @@ local function _rule_match(rules)
 						
 						
                                                 ctx_rule_log.rule_match_key = _operator_key
-						ctx_rule_log.rule_url = ngx.var.request_uri
+						ctx_rule_log.rule_uri = ngx.var.uri
 						ctx_rule_log.rule_remote_ip = ngx.var.remote_addr
 						ctx_rule_log.rule_match_captures = captures
 
@@ -282,32 +313,53 @@ local function _rule_match(rules)
                     ctx_rule_log.rule_category = rule.rule_category
                     ctx_rule_log.rule_action = rule.rule_action
 					if _config_info.log_all == "true" or rule.rule_log_all=="true" then
-						ctx_rule_log.rule_raw_headers =  request.request['RAW_HEADER']()
+						ctx_rule_log.rule_headers =  request.request['REQUEST_HEADERS']()
+						ctx_rule_log.rule_url = request.request['REQUEST_URI']()
 						ctx_rule_log.rule_raw_post =  ngx.req.get_body_data()
 					end
+					if rule.rule_action == "limit_req_rate" or rule.rule_action == "limit_req_count" then
+
+					else
 					ngx.ctx.rule_log = ctx_rule_log
+					end
 				end
 				if _config_info.observ_mode == "true" and matchs_result and rule.rule_log == "true" then
 				
-					if _config_info.observ_mode_white_ip == "false" then
-						table_insert(ngx.ctx.rule_observ_log,ctx_rule_log)
-						matchs_result = false
-					else
-						for _,v in ipairs(_config_info.observ_mode_white_ip) do
-							local client_ip = ngx.var.remote_addr
-							if client_ip == v then
-								table_insert(ngx.ctx.rule_observ_log,ctx_rule_log)							
-								matchs_result = false					
-							end
 				
-						end
-					end	
+						table_insert(rule_observ_log,ctx_rule_log)
+						matchs_result = false
+		
 				end
 	
                 if rule.rule_action == "pass" and matchs_result then
 					matchs_result = false
 				end
+			if   _config_info.limitreq_engine == "true" and matchs_result and (rule.rule_action == "limit_req_rate" or rule.rule_action == "limit_req_count") then
+				local process_key
+				local limit_var = {}
+				for _,var in ipairs(rule.rule_key_vars) do
+					local process_request_var = _process_request(var)
+					if type(process_request_var) == "table" then
+						for _,v in pairs(process_request_var) do
+							if type(v) == "table" then
+								ngx.log(ngx.ERR,"LIMIT ERROR")
+								ngx.exit(403)
+							end
+							table.insert( limit_var, v )
+						end
+					else
+						table.insert( limit_var, process_request_var )
+					end
+				end
 		
+				process_key = table.concat( limit_var )  
+				if rule.rule_action == "limit_req_rate" then
+					limitreq.limit_req_rate(rule,ngx.md5(process_key))
+				elseif rule.rule_action == "limit_req_count" then
+					limitreq.limit_req_count(rule,ngx.md5(process_key))
+				end
+				matchs_result = false
+			end	
 			
 			if matchs_result then
 				return matchs_result,rule
@@ -317,11 +369,14 @@ local function _rule_match(rules)
 	 
 
 
-	
-	
+	end
+	if _config_info.observ_mode == "true" then
+		ngx.ctx.rule_observ_log = rule_observ_log
+	end
 
 	return result
 end
+
 
 
 function _M.rule_match(rules)
@@ -336,6 +391,7 @@ end
 local function _base_update_rule()
 	local _base_update_rule = {}
 	local _resp_update_rule = {}
+	local _limit_req_rule = {}
 	local _update_website  =  _config_info.base_rule_update_website or "http://update.jxwaf.com/waf/update_rule"		
 	local httpc = http.new()
 	local api_key = _config_info.waf_api_key or "jxwaf"
@@ -361,22 +417,35 @@ local function _base_update_rule()
 		ngx.log(ngx.ERR,"init fail,can not decode base rule config file")
 	end
 	for _,v in ipairs(_update_rule) do
-		if v.rule_update_category == "resp" then
+		if v.rule_phase == "resp" then
 			table_insert(_resp_update_rule,v)
+			if v.rule_action == "inject_js" or v.rule_action == "rewrite" or v.rule_action == "replace" then
+				_resp_header_chunk = true
+			end
 		else
-			table_insert(_base_update_rule,v)
+			if v.rule_action == "limit_req_rate" or v.rule_action == "limit_req_count" then
+				if _config_info.limitreq_engine == "true" then
+					table_insert(_limit_req_rule,v)
+				end
+			else
+				table_insert(_base_update_rule,v)
+			end
 		end
 	end	
+
 	table_sort(_resp_update_rule,_sort_rules)
 	table_sort(_base_update_rule,_sort_rules)
+	table_sort(_limit_req_rule,_sort_rules)
 	_rules =  _base_update_rule
 	_resp_rules = _resp_update_rule
+	_limit_req_rules = _limit_req_rule 
 	ngx.log(ngx.ALERT,"success load base rule,count is "..#_rules)
 	ngx.log(ngx.ALERT,"success load resp rule,count is "..#_resp_rules)
-	
-	
+	ngx.log(ngx.ALERT,"success load limit req rule,count is "..#_limit_req_rules)
+
 	
 end
+
 
 local function _global_update_rule()
       
@@ -416,10 +485,11 @@ local function _global_update_rule()
 	_config_info.cookie_safe_is_safe = _config_info.cookie_safe_is_safe or _update_rule['cookie_safe_is_safe'] or "false"	
 	_config_info.aes_random_key = _config_info.aes_random_key or _update_rule['aes_random_key'] or  str.to_hex(resty_random.bytes(8))
 	_config_info.observ_mode =  _config_info.observ_mode or _update_rule['observ_mode'] or "false"
-	_config_info.observ_mode_white_ip =  _config_info.observ_mode_white_ip or _update_rule['observ_mode_white_ip'] or "false"
+	--_config_info.observ_mode_white_ip =  _config_info.observ_mode_white_ip or _update_rule['observ_mode_white_ip'] or "false"
 	_config_info.resp_engine =  _config_info.resp_engine or _update_rule['resp_engine'] or "false"
-    ngx.log(ngx.ALERT,"success load global config ",_config_info.base_engine)
-	if _config_info.base_engine == "true" or _config_info.resp_engine == "true" then
+	_config_info.limitreq_engine = _config_info.limitreq_engine or _update_rule['cc_engine'] or "false"
+        ngx.log(ngx.ALERT,"success load global config ",_config_info.base_engine)
+	if _config_info.base_engine == "true" or _config_info.resp_engine == "true" or _config_info.limitreq_engine == "true" then
 		_base_update_rule()
 	end
 	
@@ -475,21 +545,46 @@ function _M.base_check()
 	--	ngx.exit(500)	
 	end
 	local result,rule = _rule_match(rules)	
-
-	if( result and rule.rule_action == 'deny' ) then
-		ngx.exit(403)
-	end	 
-	if(result and rule.rule_action == 'allow') then
-		ngx.exit(0)
-	end
-	if(result and rule.rule_action == "redirect") then
 	
-		ngx.redirect(_config_info.http_redirect)	
-		
+	if result then
+		if rule.rule_action == 'deny' then
+			ngx.exit(403)
+		elseif rule.rule_action == 'allow' then
+			ngx.exit(0)
+		elseif rule.rule_action == 'redirect' then
+			ngx.redirect(_config_info.http_redirect)
+		elseif rule.rule_action == 'rewrite' then
+--			ngx.ctx.resp_action = "rewrite"
+--			ngx.ctx.resp_rewrite_data = rule.rule_action_data
+			ngx.header["Content-Type"] = "text/html; charset=utf-8"
+			ngx.say(ngx.decode_base64(rule.rule_action_data))		
+		elseif rule.rule_action == 'inject_js' then
+			ngx.ctx.resp_action = "inject_js"
+			ngx.ctx.resp_inject_js_data = rule.rule_action_data
+		elseif rule.rule_action == "replace" then
+			ngx.ctx.resp_action = "replace"
+			ngx.ctx.resp_replace_check = rule.rule_action_data
+			ngx.ctx.resp_replace_data = rule.rule_action_replace_data
+		else
+			ngx.log(ngx.ERR,"rule action ERR!")
+		end
 	end
+
 	end
 end
 
+function _M.limitreq_check()
+	if _config_info.limitreq_engine == "true" then
+		local rules = _limit_req_rules
+		if #rules == 0 then
+			ngx.log(ngx.CRIT,"can not find limitreq rules")	
+			ngx.exit(500)
+		end
+		local result = _rule_match(rules)	
+	
+		
+	end
+end
 
 function _M.access_init()
 	local content_type = ngx.req.get_headers()["Content-type"]
@@ -582,5 +677,8 @@ function _M.access_init()
 	end
 end
 
+function _M.resp_header_chunk()
+	return _resp_header_chunk
+end
 
 return _M
